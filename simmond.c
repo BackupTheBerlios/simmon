@@ -16,6 +16,7 @@
  * - support for other then EN10MB devices (already done PPP)
  * - fast "fixed size" memory allocator (do not use slow libc malloc/free routines)
  * - switch from tree to hash
+ * - get rid of binary dump, leave ascii only
  *
  */
 
@@ -44,104 +45,77 @@
 #include <netinet/udp.h>
 
 
-/* Make "long long" type portable */
-#if __BYTE_ORDER == __BIG_ENDIAN
-#define htonll(x) (x)
-#define ntohll(x) (x)
-#else
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-#define htonll(x) __bswap_64(x)
-#define ntohll(x) __bswap_64(x)
-#endif
-#endif
-
-
 /* Hardcoded maximum number of collected ranges */
-#define MAX_RANGES 256
+#define MAX_RANGES 64
 
 
-struct __range
+struct __selector
 {
-  int proto;
-  int start_port;
-  int stop_port;
-  long long remote_input_packets;
-  long long remote_input_bytes;
-  long long remote_output_packets;
-  long long remote_output_bytes;
-  long long local_input_packets;
-  long long local_input_bytes;
-  long long local_output_packets;
-  long long local_output_bytes;
+  uint8_t  proto;
+  uint16_t start_port;
+  uint16_t stop_port;
+  uint64_t remote_input_packets;
+  uint64_t remote_input_bytes;
+  uint64_t remote_output_packets;
+  uint64_t remote_output_bytes;
+  uint64_t local_input_packets;
+  uint64_t local_input_bytes;
+  uint64_t local_output_packets;
+  uint64_t local_output_bytes;
 };
 
-typedef struct __range range;
+typedef struct __selector selector;
 
 
-struct __stat
+struct __host
 {
-  int ranges_size;
-  long long tcp_input_packets;
-  long long tcp_input_bytes;
-  long long tcp_output_packets;
-  long long tcp_output_bytes;
-  long long udp_input_packets;
-  long long udp_input_bytes;
-  long long udp_output_packets;
-  long long udp_output_bytes;
-  long long icmp_input_packets;
-  long long icmp_input_bytes;
-  long long icmp_output_packets;
-  long long icmp_output_bytes;
-  long long other_input_packets;
-  long long other_input_bytes;
-  long long other_output_packets;
-  long long other_output_bytes;
-  range ranges_array[0];
+  uint64_t id;
+  struct __host* next;
+  uint64_t tcp_input_packets;
+  uint64_t tcp_input_bytes;
+  uint64_t tcp_output_packets;
+  uint64_t tcp_output_bytes;
+  uint64_t udp_input_packets;
+  uint64_t udp_input_bytes;
+  uint64_t udp_output_packets;
+  uint64_t udp_output_bytes;
+  uint64_t icmp_input_packets;
+  uint64_t icmp_input_bytes;
+  uint64_t icmp_output_packets;
+  uint64_t icmp_output_bytes;
+  uint64_t other_input_packets;
+  uint64_t other_input_bytes;
+  uint64_t other_output_packets;
+  uint64_t other_output_bytes;
+  selector selectors[0];
 };
 
-typedef struct __stat *stat;
-
-
-struct __node
-{
-  void *left;
-  void *right;
-};
-
-typedef struct __node *node;
+typedef struct __host *host;
 
 
 typedef int (*handler) (char *);
 
 
-typedef void (*dumper) (FILE *, stat, unsigned int);
-
-
 /* Global vars: stats */
-static int allocated_nodes = 0;
-static int allocated_stats = 0;
-static long long total_packets = 0;
-static long long total_bytes = 0;
-static int work_time = 0;
+static uint32_t allocated_hosts = 0;
+static uint32_t allocated_chunks = 0;
+static uint32_t work_time = 0;
+static uint64_t total_packets = 0;
+static uint64_t total_bytes = 0;
 
 /* Global vars: file handles and names */
-//static FILE *dump_handle = NULL;
-static char *dump_binary_name = NULL;
-static char *dump_ascii_name = NULL;
-static char *dump_stats_name = NULL;
+static char* dump_path = NULL;
 
 /* Global vars: sniffing params */
-static char *device_name = NULL;
+static char* device_name = NULL;
 static int device_promisc = 0;
-static int sniff_count = 0;
-static int sniff_limit = 0;
-static int sniff_addr = 0;
-static int sniff_mask = 0;
+static uint32_t sniff_count = 0;
+static uint32_t sniff_limit = 0;
+static uint32_t sniff_addr = 0;
+static uint32_t sniff_mask = 0;
 
 /* Global vars: flags */
 static int is_processing = 0;
-static int dump_binary_request = 0;
 static int dump_ascii_request = 0;
 static int free_request = 0;
 static int dump_packets = 0;
@@ -153,7 +127,7 @@ static stat pattern = NULL;
 static node root = NULL;
 
 
-void stat_ascii_dump(FILE * f, stat s, unsigned int address)
+void dumper(FILE * f, stat s, unsigned int address)
 {
   int i;
   char *prefix;
@@ -163,16 +137,15 @@ void stat_ascii_dump(FILE * f, stat s, unsigned int address)
   if(f != NULL && s != NULL)
   {
     fprintf(f,
-            "%s tcp:%lld:%lld:%lld:%lld udp:%lld:%lld:%lld:%lld icmp:%lld:%lld:%lld:%lld unknown:%lld:%lld:%lld:%lld",
-            inet_ntoa(buff), s->tcp_input_packets, s->tcp_input_bytes, s->tcp_output_packets,
-            s->tcp_output_bytes, s->udp_input_packets, s->udp_input_bytes, s->udp_output_packets,
-            s->udp_output_bytes, s->icmp_input_packets, s->icmp_input_bytes, s->icmp_output_packets,
-            s->icmp_output_bytes, s->other_input_packets, s->other_input_bytes,
-            s->other_output_packets, s->other_output_bytes);
+            "%s %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld",
+            inet_ntoa(buff),
+            s->tcp_input_packets, s->tcp_input_bytes, s->tcp_output_packets, s->tcp_output_bytes,
+            s->udp_input_packets, s->udp_input_bytes, s->udp_output_packets, s->udp_output_bytes,
+            s->icmp_input_packets, s->icmp_input_bytes, s->icmp_output_packets, s->icmp_output_bytes,
+            s->other_input_packets, s->other_input_bytes, s->other_output_packets, s->other_output_bytes);
 
-    for(i = 0; i < s->ranges_size; i++)
+    for(i = 0, r = s->ranges_array; i < ranges_size; i++, r++)
     {
-      r = s->ranges_array + i;
       switch (r->proto)
       {
       case IPPROTO_TCP:
@@ -208,35 +181,35 @@ void stat_binary_dump(FILE * f, stat s, unsigned int address)
   struct
   {
     int address;
-    long long tcp_input_packets;
-    long long tcp_input_bytes;
-    long long tcp_output_packets;
-    long long tcp_output_bytes;
-    long long udp_input_packets;
-    long long udp_input_bytes;
-    long long udp_output_packets;
-    long long udp_output_bytes;
-    long long icmp_input_packets;
-    long long icmp_input_bytes;
-    long long icmp_output_packets;
-    long long icmp_output_bytes;
-    long long other_input_packets;
-    long long other_input_bytes;
-    long long other_output_packets;
-    long long other_output_bytes;
+    uint64_t tcp_input_packets;
+    uint64_t tcp_input_bytes;
+    uint64_t tcp_output_packets;
+    uint64_t tcp_output_bytes;
+    uint64_t udp_input_packets;
+    uint64_t udp_input_bytes;
+    uint64_t udp_output_packets;
+    uint64_t udp_output_bytes;
+    uint64_t icmp_input_packets;
+    uint64_t icmp_input_bytes;
+    uint64_t icmp_output_packets;
+    uint64_t icmp_output_bytes;
+    uint64_t other_input_packets;
+    uint64_t other_input_bytes;
+    uint64_t other_output_packets;
+    uint64_t other_output_bytes;
   }
   total_buff;
 
   struct
   {
-    long long remote_input_packets;
-    long long remote_input_bytes;
-    long long remote_output_packets;
-    long long remote_output_bytes;
-    long long local_input_packets;
-    long long local_input_bytes;
-    long long local_output_packets;
-    long long local_output_bytes;
+    uint64_t remote_input_packets;
+    uint64_t remote_input_bytes;
+    uint64_t remote_output_packets;
+    uint64_t remote_output_bytes;
+    uint64_t local_input_packets;
+    uint64_t local_input_bytes;
+    uint64_t local_output_packets;
+    uint64_t local_output_bytes;
   }
   range_buff;
 
@@ -324,78 +297,6 @@ void tree_ascii_dump(node root)
 }
 
 
-void header_binary_dump(FILE * f)
-{
-  int i;
-
-  struct
-  {
-    int magic;
-    int version;
-    char device[16];
-    int start_time;
-    int stop_time;
-    int size;
-  }
-  header_buff;
-
-  struct
-  {
-    int proto;
-    int start_port;
-    int stop_port;
-  }
-  pattern_buff;
-
-  if(f != NULL && pattern != NULL)
-  {
-    header_buff.magic = htonl(0x31037820);
-    header_buff.version = htonl(0x01000000);
-    strncpy(header_buff.device, device_name, sizeof(header_buff.device) - 1);
-    header_buff.device[sizeof(header_buff.device) - 1] = 0;
-    header_buff.start_time = htonl(work_time);
-    header_buff.stop_time = htonl(time(NULL));
-    header_buff.size = htonl(pattern->ranges_size);
-
-    fwrite(&header_buff, sizeof(header_buff), 1, f);
-
-    for(i = 0; i < pattern->ranges_size; i++)
-    {
-      pattern_buff.proto = htonl(pattern->ranges_array[i].proto);
-      pattern_buff.start_port = htonl(pattern->ranges_array[i].start_port);
-      pattern_buff.stop_port = htonl(pattern->ranges_array[i].stop_port);
-
-      fwrite(&pattern_buff, sizeof(pattern_buff), 1, f);
-    }
-  }
-}
-
-
-void tree_binary_dump(node root)
-{
-  FILE *f;
-
-  if(dump_binary_name != NULL)
-  {
-    if((f = fopen(dump_binary_name, "w+")) != NULL)
-    {
-      header_binary_dump(f);
-      node_dump(f, root, 0, 0x80000000, stat_binary_dump);
-      fflush(f);
-      fclose(f);
-    }
-  }
-  else
-  {
-    header_binary_dump(stdout);
-    node_dump(stdout, root, 0, 0x80000000, stat_binary_dump);
-    fflush(stdout);
-  }
-
-  dump_binary_request = 0;
-}
-
-
 void __stats_dump(FILE * f)
 {
   if(f != NULL)
@@ -430,15 +331,15 @@ void stats_dump()
 }
 
 
-void packet_dump(FILE * f, int proto, int size, unsigned int src_host, int src_port,
+void packet_dump(FILE* f, int proto, int size, unsigned int src_host, int src_port,
                  unsigned int dst_host, int dst_port)
 {
   struct in_addr src_buff = { src_host };
   struct in_addr dst_buff = { dst_host };
 
-  if(f != NULL)
-  {
-    switch (proto)
+  if(f == NULL) return;
+
+  switch (proto)
     {
     case IPPROTO_TCP:
       fprintf(f, "tcp   %16s : %-5d  > ", inet_ntoa(src_buff), src_port);
@@ -457,7 +358,6 @@ void packet_dump(FILE * f, int proto, int size, unsigned int src_host, int src_p
       fprintf(f, "%16s        %5d bytes\n", inet_ntoa(dst_buff), size);
       break;
     }
-  }
 }
 
 
@@ -746,8 +646,6 @@ int ip_handler(struct ip *ip_header)
         packet_dump(stderr, proto, size, src_host, src_port, dst_host, dst_port);
     }
 
-    if(dump_binary_request)
-      tree_binary_dump(root);
     if(dump_ascii_request)
       tree_ascii_dump(root);
     if(free_request)
@@ -812,16 +710,6 @@ void signal_ascii_dump(int sig)
     dump_ascii_request = 1;
   else
     tree_ascii_dump(root);
-}
-
-
-/* Handle SIGUSR2 */
-void signal_binary_dump(int sig)
-{
-  if(is_processing)
-    dump_binary_request = 1;
-  else
-    tree_binary_dump(root);
 }
 
 
@@ -972,35 +860,33 @@ int parse_pattern(char *input, int *proto, int *start_port, int *stop_port)
 void usage(char *arg0)
 {
   fprintf(stdout,
-          "\nUsage:\n\n    %s [-a file] [-b file] [-c limit] [-f filter] [-g group] [-i iface] [-m addr[/mask]] [-p] [-s file] [-u user] [-v] [expression1 [expressionN...]]\n\n",
+          "\nUsage:\n\n    %s [-d file] [-c limit] [-f filter] [-g group] [-i iface] [-m addr[/mask]] [-p] [-u user] [-v] [selector1 [selectorN...]]\n\n",
           arg0);
   fprintf(stdout, "\nOptions:\n\n");
-  fprintf(stdout, "   -a file            - ASCII format dump file\n");
-  fprintf(stdout, "   -b file            - Binary format dump file\n");
-  fprintf(stdout, "   -s file            - Stats dump file (ascii format)\n");
+  fprintf(stdout, "   -d file            - Dump file path, stdout if not given\n");
   fprintf(stdout, "   -i iface           - Network interface to listen on (see tcpdump)\n");
   fprintf(stdout, "   -p                 - Set interface to promiscous (see tcpdump)\n");
-  fprintf(stdout, "   -v                 - Verbous, print processed packets do stderr\n");
+  fprintf(stdout, "   -v                 - Verbous, print processed packets to stderr\n");
   fprintf(stdout, "   -f filter          - Set captured packets BPF filter (see tcpdump)\n");
   fprintf(stdout, "   -c limit           - Set captured packets limit (see tcpdump)\n");
   fprintf(stdout,
           "   -m ip[/mask]       - Limit collected hosts to given ip. Mask can be in dotted or bits format\n");
   fprintf(stdout, "   -u user            - Set process UID\n");
   fprintf(stdout, "   -g group           - Set process GID\n");
-  fprintf(stdout, "\nExpressions:\n\n");
+  fprintf(stdout, "\nSelectors:\n\n");
   fprintf(stdout,
-          "   Arguments selecting collected traffic are in form PROTOCOL[:START_PORT[:STOP_PORT]].\n");
+          "   Selecting arguments are in form PROTOCOL[:START_PORT[:STOP_PORT]].\n");
   fprintf(stdout,
           "   Where protocol may be \"tcp\", \"udp\" and \"icmp\". Start and stop ports are optional.\n");
   fprintf(stdout,
-          "   For tcp and udp their meaning is obvious. For icmp they mean icmp message types.\n");
+          "   For tcp and udp their meaning is obvious, for icmp they are interpreted as icmp message types.\n");
   fprintf(stdout,
-          "   If stop port is not specified, it's the same as start port. For example \"tcp:80\" would\n");
+          "   If stop port is not specified, it's the same as start port, for example \"tcp:80\" would\n");
   fprintf(stdout,
           "   collect traffic for http protocol, \"tcp:0:1023\" would collect traffic for all low tcp\n");
-  fprintf(stdout, "   ports and \"icmp:8\" collects icmp echo request (ping) messages.\n");
+  fprintf(stdout, "   ports and \"icmp:8\" would collect icmp echo request (ping) messages.\n");
   fprintf(stdout,
-          "\nExamples:\n\n    %s -i eth0 -b traffic.binary -u nobody -m 192.168.0.0/16 tcp:80 tcp:25 tcp:110 udp:53\n",
+          "\nExamples:\n\n    %s -i eth0 -d traffic -u nobody -m 192.168.0.0/16 tcp:80 tcp:25 tcp:110 udp:53\n",
           arg0);
   fprintf(stdout,
           "    %s -f 'tcp && ((src net 192.168.0.0/16 && ! dst net 192.168.0.0/16) || (dst net 192.168.0.0/16 && ! src net 192.168.0.0/16))' tcp:80 tcp:25 tcp:110 tcp:0:1024\n\n",
@@ -1054,25 +940,11 @@ int main(int argc, char **argv)
         device_name = argv[++i];
         continue;
       }
-      if(strcmp(argv[i], "-a") == 0)
+      if(strcmp(argv[i], "-d") == 0)
       {
         if(i >= argc - 1)
           usage(argv[0]);
         dump_ascii_name = argv[++i];
-        continue;
-      }
-      if(strcmp(argv[i], "-b") == 0)
-      {
-        if(i >= argc - 1)
-          usage(argv[0]);
-        dump_binary_name = argv[++i];
-        continue;
-      }
-      if(strcmp(argv[i], "-s") == 0)
-      {
-        if(i >= argc - 1)
-          usage(argv[0]);
-        dump_stats_name = argv[++i];
         continue;
       }
       if(strcmp(argv[i], "-f") == 0)
