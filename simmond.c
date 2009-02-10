@@ -15,6 +15,7 @@
  *
  * - support for other then EN10MB devices (already done PPP)
  * - fast "fixed size" memory allocator (do not use slow libc malloc/free routines)
+ * - switch from tree to hash
  *
  */
 
