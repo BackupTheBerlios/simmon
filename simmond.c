@@ -23,6 +23,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -46,7 +47,7 @@
 
 
 /* Hardcoded maximum number of collected ranges */
-#define MAX_RANGES 64
+#define MAX_SELECTORS 64
 
 
 struct __selector
@@ -69,7 +70,7 @@ typedef struct __selector selector;
 
 struct __host
 {
-  uint64_t id;
+  uint64_t address;
   struct __host* next;
   uint64_t tcp_input_packets;
   uint64_t tcp_input_bytes;
@@ -90,10 +91,10 @@ struct __host
   selector selectors[0];
 };
 
-typedef struct __host *host;
+typedef struct __host host;
 
 
-typedef int (*handler) (char *);
+typedef int (*packet_handler) (char *);
 
 
 /* Global vars: stats */
@@ -116,192 +117,100 @@ static uint32_t sniff_mask = 0;
 
 /* Global vars: flags */
 static int is_processing = 0;
-static int dump_ascii_request = 0;
-static int free_request = 0;
-static int dump_packets = 0;
+static int dump_request = 0;
 
-/* Global vars: stat struct pattern for collecting traffic */
-static stat pattern = NULL;
+/* Global vars: pattern for collecting traffic */
+static uint32_t selectors_size = 0;
+static selector selectors_data[] = selector[MAX_SELECTORS];
 
-/* Global vars: tree root */
-static node root = NULL;
+/* Global vars: hash */
+static uint32_t hash_size = 1024;
+static host* hash_data[] = NULL;
 
+//////////////////////////////////////////////////////////////////////////////////////
 
-void dumper(FILE * f, stat s, unsigned int address)
+struct __chunk
 {
-  int i;
-  char *prefix;
-  struct in_addr buff = { address };
-  range *r;
+  struct __chunk *next;
+  uint32_t size;
+  uint32_t index;
+  host hosts[0];
+};
 
-  if(f != NULL && s != NULL)
+typedef struct __chunk chunk;
+
+chunk* chunks = NULL;
+
+chunk* alloc_chunk()
+{
+  chunk* c;
+  if ((c = (chunk*)malloc(sizeof(chunk) + (sizeof(host) + sizeof(selector) * selectors_size) * 65536)) == NULL) return(NULL);
+  c->next = NULL;
+  c->size = 65536;
+  c->index = 0;
+  return(c);
+}
+
+host* alloc_host()
+{
+  chunk* c = chunks;
+  if (c == NULL)
+    if ((c = chunks = alloc_chunk()) == NULL) return(NULL);
+  if (c->index >= c->size)
   {
+    chunk* new_c = alloc_chunk();
+    if (new_c == NULL) return(NULL);
+    new_c->next = c;
+    chunks = c = new_c;
+  }
+  host* h = c->host + c->index;
+  bzero(h, sizeof(host) + sizeof(selector) * selectors_size);
+  c->index++;
+  return(h);
+}
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+void dump_host(FILE* f, host* h)
+{
+  selector* s;
+
+  if (f == NULL || h == NULL) return;
+
+  fprintf(f,
+            "%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld",
+            h->address,
+            h->tcp_input_packets, h->tcp_input_bytes, h->tcp_output_packets, h->tcp_output_bytes,
+            h->udp_input_packets, h->udp_input_bytes, h->udp_output_packets, h->udp_output_bytes,
+            h->icmp_input_packets, h->icmp_input_bytes, h->icmp_output_packets, h->icmp_output_bytes,
+            h->other_input_packets, h->other_input_bytes, h->other_output_packets, h->other_output_bytes);
+
+  for(uint32_t i = selectors_size, s = h->selectors; i > 0; i--, s++)
     fprintf(f,
-            "%s %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld %lld:%lld:%lld:%lld",
-            inet_ntoa(buff),
-            s->tcp_input_packets, s->tcp_input_bytes, s->tcp_output_packets, s->tcp_output_bytes,
-            s->udp_input_packets, s->udp_input_bytes, s->udp_output_packets, s->udp_output_bytes,
-            s->icmp_input_packets, s->icmp_input_bytes, s->icmp_output_packets, s->icmp_output_bytes,
-            s->other_input_packets, s->other_input_bytes, s->other_output_packets, s->other_output_bytes);
+              " %lld %lld %lld %lld %lld %lld %lld %lld",
+              s->remote_input_packets, s->remote_input_bytes,
+              s->remote_output_packets, s->remote_output_bytes,
+              s->local_input_packets, s->local_input_bytes,
+              s->local_output_packets, s->local_output_bytes);
 
-    for(i = 0, r = s->ranges_array; i < ranges_size; i++, r++)
-    {
-      switch (r->proto)
-      {
-      case IPPROTO_TCP:
-        prefix = "tcp";
-        break;
-      case IPPROTO_UDP:
-        prefix = "udp";
-        break;
-      case IPPROTO_ICMP:
-        prefix = "icmp";
-        break;
-      default:
-        prefix = "unknown";
-        break;
-      }
-
-      fprintf(f, " %s:%d:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld",
-              prefix, r->start_port, r->stop_port,
-              r->remote_input_packets, r->remote_input_bytes, r->remote_output_packets,
-              r->remote_output_bytes, r->local_input_packets, r->local_input_bytes,
-              r->local_output_packets, r->local_output_bytes);
-    }
-    fprintf(f, "\n");
-  }
+  fprintf(f, "\n");
 }
 
-
-void stat_binary_dump(FILE * f, stat s, unsigned int address)
+void dump_hash(FILE* f, host** hash, uint32_t size)
 {
-  int i;
-  range *r;
+  if (f == NULL || hash == NULL) return;
 
-  struct
-  {
-    int address;
-    uint64_t tcp_input_packets;
-    uint64_t tcp_input_bytes;
-    uint64_t tcp_output_packets;
-    uint64_t tcp_output_bytes;
-    uint64_t udp_input_packets;
-    uint64_t udp_input_bytes;
-    uint64_t udp_output_packets;
-    uint64_t udp_output_bytes;
-    uint64_t icmp_input_packets;
-    uint64_t icmp_input_bytes;
-    uint64_t icmp_output_packets;
-    uint64_t icmp_output_bytes;
-    uint64_t other_input_packets;
-    uint64_t other_input_bytes;
-    uint64_t other_output_packets;
-    uint64_t other_output_bytes;
-  }
-  total_buff;
-
-  struct
-  {
-    uint64_t remote_input_packets;
-    uint64_t remote_input_bytes;
-    uint64_t remote_output_packets;
-    uint64_t remote_output_bytes;
-    uint64_t local_input_packets;
-    uint64_t local_input_bytes;
-    uint64_t local_output_packets;
-    uint64_t local_output_bytes;
-  }
-  range_buff;
-
-  if(f != NULL && s != NULL)
-  {
-    total_buff.address = address; /* already in network byte order! */
-    total_buff.tcp_input_packets = htonll(s->tcp_input_packets);
-    total_buff.tcp_input_bytes = htonll(s->tcp_input_bytes);
-    total_buff.tcp_output_packets = htonll(s->tcp_output_packets);
-    total_buff.tcp_output_bytes = htonll(s->tcp_output_bytes);
-    total_buff.udp_input_packets = htonll(s->udp_input_packets);
-    total_buff.udp_input_bytes = htonll(s->udp_input_bytes);
-    total_buff.udp_output_packets = htonll(s->udp_output_packets);
-    total_buff.udp_output_bytes = htonll(s->udp_output_bytes);
-    total_buff.icmp_input_packets = htonll(s->icmp_input_packets);
-    total_buff.icmp_input_bytes = htonll(s->icmp_input_bytes);
-    total_buff.icmp_output_packets = htonll(s->icmp_output_packets);
-    total_buff.icmp_output_bytes = htonll(s->icmp_output_bytes);
-    total_buff.other_input_packets = htonll(s->other_input_packets);
-    total_buff.other_input_bytes = htonll(s->other_input_bytes);
-    total_buff.other_output_packets = htonll(s->other_output_packets);
-    total_buff.other_output_bytes = htonll(s->other_output_bytes);
-
-    fwrite(&total_buff, sizeof(total_buff), 1, f);
-
-    for(i = 0; i < s->ranges_size; i++)
-    {
-      r = s->ranges_array + i;
-      range_buff.remote_input_packets = htonll(r->remote_input_packets);
-      range_buff.remote_input_bytes = htonll(r->remote_input_bytes);
-      range_buff.remote_output_packets = htonll(r->remote_output_packets);
-      range_buff.remote_output_bytes = htonll(r->remote_output_bytes);
-      range_buff.local_input_packets = htonll(r->local_input_packets);
-      range_buff.local_input_bytes = htonll(r->local_input_bytes);
-      range_buff.local_output_packets = htonll(r->local_output_packets);
-      range_buff.local_output_bytes = htonll(r->local_output_bytes);
-      fwrite(&range_buff, sizeof(range_buff), 1, f);
-    }
-  }
+  for(; size > 0; size--, hash++)
+    for(host* h = *hash; h != NULL; h = h->next)
+      dump_host(f, h);
 }
 
-
-/* Traverse binary tree dumping stats kept in leafs */
-void node_dump(FILE * f, node root, unsigned int address, unsigned int mask, dumper d)
+void dump_stats(FILE * f)
 {
-  if(f != NULL && root != NULL)
-  {
-    if(mask > 1)
-    {
-      node_dump(f, root->left, address & (~mask), mask >> 1, d);
-      node_dump(f, root->right, address | mask, mask >> 1, d);
-    }
-    else
-    {
-      if(d != NULL)
-      {
-        d(f, root->right, address | mask);
-        d(f, root->left, address & (~mask));
-      }
-    }
-  }
-}
+  if (f == NULL) return;
 
-
-void tree_ascii_dump(node root)
-{
-  FILE *f;
-
-  if(dump_ascii_name != NULL)
-  {
-    if((f = fopen(dump_ascii_name, "w+")) != NULL)
-    {
-      node_dump(f, root, 0, 0x80000000, stat_ascii_dump);;
-      fflush(f);
-      fclose(f);
-    }
-  }
-  else
-  {
-    node_dump(stdout, root, 0, 0x80000000, stat_ascii_dump);
-    fflush(stdout);
-  }
-
-  dump_ascii_request = 0;
-}
-
-
-void __stats_dump(FILE * f)
-{
-  if(f != NULL)
-  {
-    fprintf(f, "device: %s\n"
+  fprintf(f,
+            "device: %s\n"
             "packets: %lld\n"
             "bytes: %lld\n"
             "nodes: %d\n"
@@ -309,29 +218,10 @@ void __stats_dump(FILE * f)
             "time: %ld\n",
             device_name,
             total_packets, total_bytes, allocated_nodes, allocated_stats, time(NULL) - work_time);
-    fflush(f);
-  }
+  fflush(f);
 }
 
-
-void stats_dump()
-{
-  FILE *f;
-
-  if(dump_stats_name != NULL)
-  {
-    if((f = fopen(dump_stats_name, "w+")) != NULL)
-    {
-      __stats_dump(f);
-      fclose(f);
-    }
-  }
-  else
-    __stats_dump(stdout);
-}
-
-
-void packet_dump(FILE* f, int proto, int size, unsigned int src_host, int src_port,
+void dump_packet(FILE* f, int proto, int size, unsigned int src_host, int src_port,
                  unsigned int dst_host, int dst_port)
 {
   struct in_addr src_buff = { src_host };
@@ -360,6 +250,7 @@ void packet_dump(FILE* f, int proto, int size, unsigned int src_host, int src_po
     }
 }
 
+//////////////////////////////////////////////////////////////////////////////////////
 
 stat alloc_stat()
 {
