@@ -123,11 +123,9 @@ static int dump_request = 0;
 static uint32_t selectors_size = 0;
 static selector selectors_data[] = selector[MAX_SELECTORS];
 
-/* Global vars: hash */
-static uint32_t hash_size = 1024;
-static host* hash_data[] = NULL;
-
 //////////////////////////////////////////////////////////////////////////////////////
+
+#define CHUNK_SIZE 65536
 
 struct __chunk
 {
@@ -144,9 +142,9 @@ chunk* chunks = NULL;
 chunk* alloc_chunk()
 {
   chunk* c;
-  if ((c = (chunk*)malloc(sizeof(chunk) + (sizeof(host) + sizeof(selector) * selectors_size) * 65536)) == NULL) return(NULL);
+  if ((c = (chunk*)malloc(sizeof(chunk) + (sizeof(host) + sizeof(selector) * selectors_size) * CHUNK_SIZE)) == NULL) return(NULL);
   c->next = NULL;
-  c->size = 65536;
+  c->size = CHUNK_SIZE;
   c->index = 0;
   return(c);
 }
@@ -167,6 +165,52 @@ host* alloc_host()
   bzero(h, sizeof(host) + sizeof(selector) * selectors_size);
   c->index++;
   return(h);
+}
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t hash_seed = 0x12341234;
+uint32_t hash_size = 1024;
+host* hash_data[] = NULL;
+
+// This is murmur2 hash stripped down to handle 32bit long IP address
+uint32_t hash_ip(uint32_t ip)
+{
+  uint32_t m = 0x5bd1e995;
+  uint32_t h = hash_seed ^ len;
+
+  ip *= m;
+  ip ^= ip >> 24;
+  ip *= m;
+  h *= m;
+  h ^= ip;
+  h *= m;
+  h ^= h >> 13;
+  h *= m;
+  h ^= h >> 15;
+
+  return(h);
+}
+
+host* hash_search(uint32_t ip)
+{
+  if (hash_data == NULL)
+    if ((hash_data = (host*)calloc(hash_size, sizeof(host*))) == NULL) return(NULL);
+
+  uint32_t hash_code = hash_ip(ip) % hash_size;
+  uint64_t address = (uint64_t)ip & 0x00000000ffffffffLL;
+  if (hash_data[hash_code] == NULL)
+  {
+    hash_data[hash_code] = alloc_host();
+    hash_data[hash_code]->address = address;
+    return(hash_data[hash_code]);
+  }
+  host* h = hash_data[hash_code];
+  for(; h->next != NULL; h = h->next)
+    if (h->address == address) return(h);
+  if ((h->next = alloc_host()) == NULL) return(NULL);
+  h->next->address = address;
+  return(h->next);
 }
 
 //////////////////////////////////////////////////////////////////////////////////////
@@ -252,156 +296,23 @@ void dump_packet(FILE* f, int proto, int size, unsigned int src_host, int src_po
 
 //////////////////////////////////////////////////////////////////////////////////////
 
-stat alloc_stat()
-{
-  stat new_stat;
-  int i;
-
-  if(pattern == NULL)
-  {
-    if((new_stat = (stat) malloc(sizeof(*new_stat))) != NULL)
-    {
-      memset(new_stat, 0, sizeof(*new_stat));
-      allocated_stats++;
-    }
-  }
-  else
-  {
-    if((new_stat =
-        (stat) malloc(sizeof(*new_stat) + (pattern->ranges_size) * sizeof(range))) != NULL)
-    {
-      memset(new_stat, 0, sizeof(*new_stat) + (pattern->ranges_size) * sizeof(range));
-      new_stat->ranges_size = pattern->ranges_size;
-
-      for(i = 0; i < new_stat->ranges_size; i++)
-      {
-        new_stat->ranges_array[i].proto = pattern->ranges_array[i].proto;
-        new_stat->ranges_array[i].start_port = pattern->ranges_array[i].start_port;
-        new_stat->ranges_array[i].stop_port = pattern->ranges_array[i].stop_port;
-      }
-      allocated_stats++;
-    }
-  }
-
-  return new_stat;
-}
-
-
-void free_stat(stat * s)
-{
-  if(s != NULL && *s != NULL)
-  {
-    free(*s);
-    *s = NULL;
-    allocated_stats--;
-  }
-}
-
-
-node alloc_node()
-{
-  node new_node;
-
-  if((new_node = (node) malloc(sizeof(*new_node))) != NULL)
-  {
-    new_node->left = NULL;
-    new_node->right = NULL;
-    allocated_nodes++;
-  }
-
-  return new_node;
-}
-
-
-void free_node(node * n)
-{
-  if(n != NULL && *n != NULL)
-  {
-    free(*n);
-    *n = NULL;
-    allocated_nodes--;
-  }
-}
-
-
-/* HOTSPOT!!! Traverse binary tree finding given stat - alloc any nodes/leafs if needed */
-stat find_stat(node * root, unsigned int address)
-{
-  unsigned int mask;
-  stat *found_stat;
-
-  if(root != NULL)
-  {
-    for(mask = 0x80000000; mask > 1; mask >>= 1)
-    {
-      if(*root == NULL && (*root = alloc_node()) == NULL)
-        return NULL;
-      root = (node *) ((address & mask) ? &((*root)->right) : &((*root)->left));
-    }
-
-    if(*root == NULL && (*root = alloc_node()) == NULL)
-      return NULL;
-    found_stat = (stat *) ((address & mask) ? &((*root)->right) : &((*root)->left));
-    if(*found_stat == NULL)
-      *found_stat = alloc_stat();
-
-    return *found_stat;
-  }
-
-  return NULL;
-}
-
-
-/* Recursive free binary tree node */
-void node_free(node * root, unsigned int mask)
-{
-  if(root != NULL && *root != NULL)
-  {
-    if(mask > 1)
-    {
-      node_free((node *) & ((*root)->left), mask >> 1);
-      node_free((node *) & ((*root)->right), mask >> 1);
-    }
-    else
-    {
-      free_stat((stat *) & ((*root)->right));
-      free_stat((stat *) & ((*root)->left));
-    }
-
-    free_node(root);
-  }
-}
-
-
-/* Free whole binary tree */
-void tree_free(node * root)
-{
-  node_free(root, 0x80000000);
-  total_packets = 0;
-  total_bytes = 0;
-  work_time = time(NULL);
-  free_request = 0;
-}
-
-
 /* Handle IP packet frame */
 int ip_handler(struct ip *ip_header)
 {
-  struct tcphdr *tcp_header;
-  struct udphdr *udp_header;
+  struct tcphdr  *tcp_header;
+  struct udphdr  *udp_header;
   struct icmphdr *icmp_header;
 
-  int i;
-  int proto;
-  unsigned int src_host;
-  unsigned int dst_host;
-  int src_port;
-  int dst_port;
-  int size;
-  int flag = 0;
-  int result = 0;
-  stat s;
-  range *r;
+  uint32_t src_host;
+  uint32_t dst_host;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint16_t size;
+  uint8_t proto;
+
+  uint32_t i;
+  host* h;
+  selector* s;
 
   if(ip_header != NULL)
   {
@@ -412,7 +323,7 @@ int ip_handler(struct ip *ip_header)
     dst_host = ip_header->ip_dst.s_addr;
     dst_port = 0;
 
-    switch (proto)
+    switch(proto)
     {
     case IPPROTO_TCP:
       tcp_header = (struct tcphdr *)(ip_header + 1);
@@ -433,46 +344,44 @@ int ip_handler(struct ip *ip_header)
       break;
     }
 
-
     is_processing = 1;
 
-    if((src_host & sniff_mask) == sniff_addr && (s = find_stat(&root, src_host)) != NULL) /* Outgoing 
-                                                                                             traffic 
-                                                                                           */
+    if((src_host & sniff_mask) == sniff_addr && (h = hash_search(src_host)) != NULL)
     {
+      /* Outgoing traffic */
       switch (proto)
       {
       case IPPROTO_TCP:
-        s->tcp_output_packets++;
-        s->tcp_output_bytes += size;
+        h->tcp_output_packets++;
+        h->tcp_output_bytes += size;
         break;
       case IPPROTO_UDP:
-        s->udp_output_packets++;
-        s->udp_output_bytes += size;
+        h->udp_output_packets++;
+        h->udp_output_bytes += size;
         break;
       case IPPROTO_ICMP:
-        s->icmp_output_packets++;
-        s->icmp_output_bytes += size;
+        h->icmp_output_packets++;
+        h->icmp_output_bytes += size;
         break;
       default:
-        s->other_output_packets++;
-        s->other_output_bytes += size;
+        h->other_output_packets++;
+        h->other_output_bytes += size;
         break;
       }
 
-      for(i = 0, r = s->ranges_array; i < s->ranges_size; i++, r++)
+      for(i = selectors_size, s = h->selectors; i > 0; i--, s++)
       {
-        if(r->proto == proto)
+        if(s->proto == proto)
         {
-          if(r->start_port <= src_port && r->stop_port >= src_port)
+          if(s->start_port <= src_port && s->stop_port >= src_port)
           {
-            r->local_output_packets++;
-            r->local_output_bytes += size;
+            s->local_output_packets++;
+            s->local_output_bytes += size;
           }
-          if(r->start_port <= dst_port && r->stop_port >= dst_port)
+          if(s->start_port <= dst_port && s->stop_port >= dst_port)
           {
-            r->remote_input_packets++;
-            r->remote_input_bytes += size;
+            s->remote_input_packets++;
+            s->remote_input_bytes += size;
           }
         }
       }
@@ -480,43 +389,42 @@ int ip_handler(struct ip *ip_header)
       flag = 1;
     }
 
-    if((dst_host & sniff_mask) == sniff_addr && (s = find_stat(&root, dst_host)) != NULL) /* Incoming 
-                                                                                             traffic 
-                                                                                           */
+    if((dst_host & sniff_mask) == sniff_addr && (h = hash_search(dst_host)) != NULL)
     {
+      /* Incoming traffic */
       switch (proto)
       {
       case IPPROTO_TCP:
-        s->tcp_input_packets++;
-        s->tcp_input_bytes += size;
+        h->tcp_input_packets++;
+        h->tcp_input_bytes += size;
         break;
       case IPPROTO_UDP:
-        s->udp_input_packets++;
-        s->udp_input_bytes += size;
+        h->udp_input_packets++;
+        h->udp_input_bytes += size;
         break;
       case IPPROTO_ICMP:
-        s->icmp_input_packets++;
-        s->icmp_input_bytes += size;
+        h->icmp_input_packets++;
+        h->icmp_input_bytes += size;
         break;
       default:
-        s->other_input_packets++;
-        s->other_input_bytes += size;
+        h->other_input_packets++;
+        h->other_input_bytes += size;
         break;
       }
 
-      for(i = 0, r = s->ranges_array; i < s->ranges_size; i++, r++)
+      for(i = selectors_size, s = h->selectors; i > 0; i--, s++)
       {
-        if(r->proto == proto)
+        if(s->proto == proto)
         {
-          if(r->start_port <= src_port && r->stop_port >= src_port)
+          if(s->start_port <= src_port && s->stop_port >= src_port)
           {
-            r->remote_output_packets++;
-            r->remote_output_bytes += size;
+            s->remote_output_packets++;
+            s->remote_output_bytes += size;
           }
-          if(r->start_port <= dst_port && r->stop_port >= dst_port)
+          if(s->start_port <= dst_port && s->stop_port >= dst_port)
           {
-            r->local_input_packets++;
-            r->local_input_bytes += size;
+            s->local_input_packets++;
+            s->local_input_bytes += size;
           }
         }
       }
@@ -534,18 +442,16 @@ int ip_handler(struct ip *ip_header)
       total_bytes += size;
 
       if(dump_packets)
-        packet_dump(stderr, proto, size, src_host, src_port, dst_host, dst_port);
+        dump_packet(stderr, proto, size, src_host, src_port, dst_host, dst_port);
     }
 
-    if(dump_ascii_request)
-      tree_ascii_dump(root);
-    if(free_request)
-      tree_free(&root);
+    if(dump_request)
+      dump_hash();
 
     is_processing = 0;
   }
 
-  return result;
+  return(0);
 }
 
 
@@ -560,7 +466,7 @@ int ethernet_handler(char *packet)
       return ip_handler((struct ip *)(eth_header + 1));
   }
 
-  return 0;
+  return(0);
 }
 
 
@@ -590,7 +496,7 @@ int ppp_handler(char *packet)
   if(proto == 0x0021 || proto == 0x0800)
     return ip_handler((struct ip *)packet);
 
-  return 0;
+  return(0);
 }
 
 
@@ -601,13 +507,6 @@ void signal_ascii_dump(int sig)
     dump_ascii_request = 1;
   else
     tree_ascii_dump(root);
-}
-
-
-/* Handle SIGINT */
-void signal_stats_dump(int sig)
-{
-  stats_dump();
 }
 
 
